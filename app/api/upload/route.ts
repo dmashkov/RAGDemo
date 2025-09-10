@@ -81,12 +81,37 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // 3) сразу триггерим индексацию (ingest) для этого docId
-      const resp = await fetch(new URL("/api/ingest", req.url), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ docId }),
-      });
+      // Надёжно формируем абсолютный origin (Netlify даёт process.env.URL)
+      const origin = process.env.URL || new URL(req.url).origin;
+      let ingestOk = false, ingestStatus = 0, ingestBody = '';
+
+      try {
+      const resp = await fetch(`${origin}/api/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // на всякий случай полностью отключим кэш и редиректы
+      redirect: 'follow',
+      body: JSON.stringify({ docId }),
+      }
+      );
+      ingestStatus = resp.status;
+      ingestBody = await resp.text();
+      ingestOk = resp.ok;
+      } catch (e: any) {
+      ingestStatus = 0;
+      ingestBody = `fetch-error: ${e?.message || String(e)}`;
+      }
+
+      results.push({
+      name: f.name,
+      size: f.size,
+      type: f.type,
+      docId,
+      storagePath,
+      ingest: { ok: ingestOk, status: ingestStatus, data: ingestBody },
+      }
+      );
+
 
       const data = await resp.text();
       results.push({
