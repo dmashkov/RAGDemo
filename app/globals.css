@@ -1,0 +1,9 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #__next { height: 100%; }
+body { @apply bg-gray-50 text-gray-900; }
+.container-narrow { @apply max-w-4xl mx-auto; }
+.card { @apply bg-white rounded-2xl shadow p-6; }
+.badge { @apply inline-flex items-center px-2 py-1 rounded-lg text-xs bg-gray-100; }
