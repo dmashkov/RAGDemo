@@ -1,136 +1,218 @@
 // app/api/chat/route.ts
-import { NextResponse } from "next/server";
-import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
-import { embedTexts } from "@/lib/embed";
-import { chatWithModel } from "@/lib/llm";
-
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type Msg = { role: "user" | "assistant"; content: string };
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+import OpenAI from "openai";
 
-const SYSTEM_PROMPT = `Вы — ассистент по документам. Отвечайте строго на основе предоставленного контекста.
-Если ответа нет в контексте, честно скажите об этом и укажите, какой документ/раздел нужен.
-Цитируйте 1–3 коротких выдержки.`;
+// ====== ENV / CONFIG ======
+function env(name: string, optional = false) {
+  const v = process.env[name];
+  if (!v && !optional) throw new Error(`ENV ${name} is missing`);
+  return v || "";
+}
 
-const MIN_SIM = Number(process.env.RAG_MIN_SIM || 0.5);
-const FALLBACK_SCAN_LIMIT = Number(process.env.RAG_FALLBACK_SCAN_LIMIT || 500);
-const MAX_CONTEXT_CHUNKS = Number(process.env.RAG_MAX_CONTEXT || 6);
+const LLM_PROVIDER = (process.env.LLM_PROVIDER || "openai").toLowerCase();
+const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-4o-mini";
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
+const EMBEDDING_DIM = Number(process.env.EMBEDDING_DIM || "1536");
 
-// простая косинусная близость
-function cosine(a: number[], b: number[]) {
-  let dot = 0, na = 0, nb = 0;
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
+const MAX_CONTEXT_CHUNKS = Number(process.env.MAX_CONTEXT_CHUNKS || "10");
+const MAX_CHARS_CONTEXT = Number(process.env.MAX_CHARS_CONTEXT || "12000"); // «срезаем» контекст по символам для экономии токенов
+
+const supabase = createClient(
+  env("NEXT_PUBLIC_SUPABASE_URL"),
+  env("SUPABASE_SERVICE_ROLE_KEY")
+);
+
+// Сейчас поддерживаем OpenAI; при необходимости можно расширить под других провайдеров
+const openai =
+  LLM_PROVIDER === "openai"
+    ? new OpenAI({ apiKey: env("OPENAI_API_KEY") })
+    : null;
+
+// ====== HELPERS ======
+type Message = { role: "system" | "user" | "assistant"; content: string };
+
+function pickLastUser(messages: Message[] | undefined): string {
+  if (!messages?.length) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return String(messages[i].content ?? "").trim();
   }
-  if (na === 0 || nb === 0) return 0;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  return "";
 }
 
-// ключевые слова для грубого фильтра
-function keywordsFrom(q: string) {
-  const base = q.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/).filter(w => w.length >= 3);
-  const extra = ["llm", "ollama", "локал", "offline", "lm", "studio"];
-  return Array.from(new Set([...base, ...extra]));
+function buildSystemPrompt() {
+  return [
+    "Ты — ассистент, отвечающий строго на основе предоставленного контекста.",
+    "Если в контексте нет ответа, так и скажи: «Не нашёл ответа в загруженных документах».",
+    "Отвечай кратко и по-русски. При необходимости перечисляй номера фрагментов [#1], [#2] и т.п.",
+  ].join(" ");
 }
 
-export async function POST(req: Request) {
+function buildUserPrompt(question: string, context: string) {
+  return [
+    "Вопрос пользователя:",
+    question,
+    "",
+    "Контекст из документов (фрагменты):",
+    context,
+    "",
+    "Сформируй ответ, опираясь исключительно на контекст выше.",
+  ].join("\n");
+}
+
+function formatContextFromChunks(chunks: Array<{ content: string }>) {
+  // собираем и ограничиваем общий размер контекста
+  let total = 0;
+  const parts: string[] = [];
+  chunks.forEach((c, i) => {
+    const piece = `[#${i + 1}] ${c.content.trim()}`;
+    if (total + piece.length <= MAX_CHARS_CONTEXT) {
+      parts.push(piece);
+      total += piece.length;
+    }
+  });
+  return parts.join("\n---\n");
+}
+
+// ====== VECTORS ======
+async function embedText(text: string): Promise<number[]> {
+  if (!openai) throw new Error("Only OpenAI is supported right now.");
+  const res = await openai.embeddings.create({
+    model: EMBEDDING_MODEL,
+    input: text,
+  });
+  const vec = (res.data?.[0]?.embedding || []) as number[];
+  if (!Array.isArray(vec) || !vec.length) {
+    throw new Error("Failed to get embedding for query");
+  }
+  // На всякий: проверим совпадение размерности
+  if (EMBEDDING_DIM && vec.length !== EMBEDDING_DIM) {
+    // не падаем, но предупреждаем — на рантайме Postgres всё равно проверит
+    console.warn(
+      `Embedding dim mismatch: got ${vec.length}, expected ${EMBEDDING_DIM}`
+    );
+  }
+  return vec;
+}
+
+// ====== RETRIEVAL ======
+// Пытаемся: 1) hybrid_match_chunks (если есть), 2) semantic_match_chunks (embeddings-only),
+// 3) простой бэкап – последние чанки (не релевантно, но лучше, чем упасть).
+async function retrieveTopChunks(question: string, qVec: number[]) {
+  // 1) гибридная
   try {
-    const body = await req.json();
-    const messages = (body?.messages ?? []) as Msg[];
-    const lastUser = [...messages].reverse().find(m => m.role === "user")?.content?.trim() ?? "";
-    if (!lastUser) return NextResponse.json({ error: "Пустой вопрос" }, { status: 400 });
+    const r = await (supabase as any).rpc("hybrid_match_chunks", {
+      query_text: question,
+      query_embedding: qVec,
+      match_count: MAX_CONTEXT_CHUNKS,
+    } as any);
+    if (!r.error && Array.isArray(r.data) && r.data.length > 0) {
+      return r.data as Array<{ content: string; document_id: string; similarity?: number }>;
+    }
+  } catch (e) {
+    // глотаем — идём дальше
+  }
 
-    const supabase = getSupabaseAdmin();
-    const [qVec] = await embedTexts([lastUser]);
+  // 2) только векторы
+  try {
+    const r2 = await (supabase as any).rpc("semantic_match_chunks", {
+      query_embedding: qVec,
+      match_count: MAX_CONTEXT_CHUNKS,
+    } as any);
+    if (!r2.error && Array.isArray(r2.data) && r2.data.length > 0) {
+      return r2.data as Array<{ content: string; document_id: string; similarity?: number }>;
+    }
+  } catch (e) {
+    // глотаем — идём дальше
+  }
 
-    let candidates: Array<{ content: string; similarity?: number; rank?: number }> = [];
-    let used = "hybrid_match_chunks";
+  // 3) fallback: тупо последние чанки (на случай, если RPC не заведены)
+  try {
+    const fb = await supabase
+      .from("chunks")
+      .select("content, document_id")
+      .order("created_at", { ascending: false })
+      .limit(MAX_CONTEXT_CHUNKS);
+    if (!fb.error && Array.isArray(fb.data)) {
+      return fb.data as Array<{ content: string; document_id: string }>;
+    }
+  } catch {
+    // ignore
+  }
 
-    // 1) гибрид, если есть
-    try {
-      const r = await supabase.rpc("hybrid_match_chunks", {
-        query_text: lastUser,
-        query_embedding: qVec,
-        match_count: MAX_CONTEXT_CHUNKS,
-      });
-      if (!r.error && Array.isArray(r.data) && r.data.length > 0) {
-        candidates = r.data as any[];
-      } else {
-        used = "match_chunks";
-      }
-    } catch {
-      used = "match_chunks";
+  return [] as Array<{ content: string; document_id: string }>;
+}
+
+// ====== LLM CALL ======
+async function generateAnswer(question: string, contextText: string) {
+  if (!openai) throw new Error("Only OpenAI is supported right now.");
+
+  const messages: Message[] = [
+    { role: "system", content: buildSystemPrompt() },
+    { role: "user", content: buildUserPrompt(question, contextText) },
+  ];
+
+  const resp = await openai.chat.completions.create({
+    model: CHAT_MODEL,
+    temperature: 0.2,
+    messages,
+  });
+
+  const text =
+    resp.choices?.[0]?.message?.content?.trim() ||
+    "Не удалось получить ответ от модели.";
+  return text;
+}
+
+// ====== HANDLER ======
+export async function POST(req: NextRequest) {
+  try {
+    const body = (await req.json().catch(() => ({}))) as {
+      messages?: Message[];
+      question?: string; // допускаем упрощённый формат
+    };
+
+    const lastUser = (body.question || pickLastUser(body.messages)).trim();
+    if (!lastUser) {
+      return NextResponse.json(
+        { error: "В запросе нет вопроса пользователя." },
+        { status: 400 }
+      );
     }
 
-    // 2) чистый векторный RPC
-    if (used === "match_chunks" && candidates.length === 0) {
-      const r = await supabase.rpc("match_chunks", {
-        query_embedding: qVec,
-        match_count: MAX_CONTEXT_CHUNKS,
-      });
-      if (!r.error && Array.isArray(r.data)) {
-        candidates = (r.data as any[]) ?? [];
-      }
-    }
+    // 1) эмбеддинг запроса
+    const qVec = await embedText(lastUser);
 
-    // 3) локальный косинус (без RPC) + грубая фильтрация ключ. словами
-    if (candidates.length === 0) {
-      const kw = keywordsFrom(lastUser);
-      // supabase-js не умеет массив параметров в .or — поэтому два запроса
-      const likeAny = kw.map(k => `%${k}%`);
-      let pool: any[] = [];
+    // 2) поиск релевантных чанков
+    const top = await retrieveTopChunks(lastUser, qVec);
 
-      // сначала пытаемся вытянуть по ILIKE
-      for (const pat of likeAny) {
-        const r = await supabase.from("chunks").select("content, embedding").ilike("content", pat).limit(100);
-        if (!r.error && r.data) pool.push(...r.data);
-      }
+    // 3) сборка контекста
+    const contextText = formatContextFromChunks(
+      (top || []).map((x) => ({ content: String((x as any).content || "") }))
+    );
 
-      // если пусто — просто берём верхние N
-      if (pool.length === 0) {
-        const r = await supabase.from("chunks").select("content, embedding").limit(FALLBACK_SCAN_LIMIT);
-        pool = r.data || [];
-      }
+    // 4) генерация ответа
+    const answer = await generateAnswer(lastUser, contextText);
 
-      // локальный пересчёт косинуса
-      const ranked = pool
-        .filter(r => Array.isArray(r.embedding))
-        .map(r => ({ content: String(r.content || ""), similarity: cosine(qVec, r.embedding as number[]) }))
-        .sort((a, b) => (b.similarity! - a.similarity!))
-        .slice(0, MAX_CONTEXT_CHUNKS);
-
-      candidates = ranked;
-      used = "local_cosine";
-    }
-
-    const top = candidates.filter(r => (r?.content || "").trim()).slice(0, MAX_CONTEXT_CHUNKS);
-    const bestSim = Math.max(0, ...top.map(r => typeof r.similarity === "number" ? r.similarity : 0));
-
-    const context = top.map((r, i) => `# Фрагмент ${i + 1}\n${(r.content || "").slice(0, 2000)}`).join("\n\n").slice(0, 12000);
-
-    if (!context) {
-      return NextResponse.json({
-        ok: true,
-        answer:
-          "Не нашёл релевантных фрагментов в загруженных документах. " +
-          "Переформулируйте вопрос или загрузите документ, где явно есть формулировки «локальная LLM», «Ollama», «LM Studio».",
-        debug: { used, bestSim },
-      });
-    }
-
-    const userPrompt =
-      `Вопрос: ${lastUser}\n\n` +
-      `Контекст (используйте только его):\n${context}\n\n` +
-      `Если в контексте нет ответа, скажите об этом прямо.`;
-
-    const answer = await chatWithModel(SYSTEM_PROMPT, userPrompt);
-    return NextResponse.json({ ok: true, answer, debug: { used, bestSim } });
+    return NextResponse.json({
+      ok: true,
+      question: lastUser,
+      answer,
+      usedChunks: (top || []).map((t, i) => ({
+        n: i + 1,
+        preview: String((t as any).content || "").slice(0, 140),
+        document_id: (t as any).document_id || null,
+        similarity: (t as any).similarity ?? null,
+      })),
+    });
   } catch (e: any) {
     console.error("/api/chat error:", e);
-    return NextResponse.json({ error: String(e?.message || e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || String(e) },
+      { status: 500 }
+    );
   }
 }
