@@ -4,115 +4,109 @@ export const dynamic = "force-dynamic";
 
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { randomUUID } from "node:crypto";
+import { v4 as uuidv4 } from "uuid";
 
-const BUCKET = "documents";
+const BUCKET = process.env.DOCS_BUCKET || "documents";
 
-function env(n: string) {
-  const v = process.env[n];
-  if (!v) throw new Error(`ENV ${n} is missing`);
+function must(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`ENV ${name} is missing`);
   return v;
 }
 
-const supabase = createClient(env("NEXT_PUBLIC_SUPABASE_URL"), env("SUPABASE_SERVICE_ROLE_KEY"));
+const supabase = createClient(
+  must("NEXT_PUBLIC_SUPABASE_URL"),
+  must("SUPABASE_SERVICE_ROLE_KEY"),
+  { auth: { persistSession: false } }
+);
 
+// Без \p{L} — чтобы не падать на SWC/webpack
 function sanitizeFilename(name: string) {
-  const base = (name || "file").normalize("NFKC");
-  // Без \p{…} — SWC не спотыкается
-  return base.replace(/[^\w.\- ]+/g, "_").replace(/\s+/g, "_").slice(0, 140);
+  return (name || "file")
+    .replace(/[^a-zA-Z0-9._\- ]/g, "_")
+    .replace(/\s+/g, "_")
+    .slice(0, 140);
 }
 
 export async function POST(req: NextRequest) {
   try {
     const form = await req.formData();
-    const files = (form.getAll("files") as unknown[]).filter(Boolean) as File[];
-    if (!files.length) {
-      return NextResponse.json({ ok: false, error: "No files provided" }, { status: 400 });
+    const files = form.getAll("files") as File[];
+    if (!files?.length) {
+      return NextResponse.json({ ok: false, error: "No files" }, { status: 400 });
     }
 
-    const results: any[] = [];
-    // Абсолютный origin для межфункционального вызова на Netlify
+    // куда стучать за индексацией
     const origin = process.env.URL || process.env.NEXT_PUBLIC_SITE_URL || new URL(req.url).origin;
+    const ingestUrl = new URL("/.netlify/functions/ingest-background", origin).toString();
+
+    const results: any[] = [];
 
     for (const f of files) {
-      const docId = randomUUID();
-      const safe = sanitizeFilename(f.name);
-      const storagePath = `${docId}__${safe}`;
+      // 1) ключ в storage
+      const id = uuidv4();
+      const key = `${id}__${sanitizeFilename(f.name)}`;
 
-      // 1) Upload в Supabase Storage
+      // 2) загрузка в Supabase Storage
       const ab = await f.arrayBuffer();
-      const up = await supabase.storage.from(BUCKET).upload(storagePath, Buffer.from(ab), {
+      const u8 = new Uint8Array(ab);
+      const put = await supabase.storage.from(BUCKET).upload(key, u8, {
         contentType: f.type || "application/octet-stream",
         upsert: false,
       });
 
-      if (up.error) {
+      if (put.error) {
         results.push({
           name: f.name,
           size: f.size,
           type: f.type,
-          error: `storage upload: ${up.error.message}`,
+          error: `storage upload failed: ${put.error.message}`,
         });
         continue;
       }
 
-      // 2) Запись в documents (id задаём сами)
+      // 3) запись в documents
       const ins = await supabase
         .from("documents")
         .insert({
-          id: docId,
+          id, // фиксируем наш uuid
           filename: f.name,
           mime_type: f.type || "application/octet-stream",
           size_bytes: f.size ?? null,
-          storage_path: storagePath,
-          status: "uploaded",
+          storage_path: key,
+          status: "new",
+          original_text_len: null,
+          error: null,
         })
         .select("id")
         .single();
 
-      if (ins.error) {
+      if (ins.error || !ins.data) {
         results.push({
           name: f.name,
           size: f.size,
           type: f.type,
-          storagePath,
-          error: `insert document: ${ins.error.message}`,
+          storagePath: key,
+          error: `documents insert failed: ${ins.error?.message || "no data"}`,
         });
         continue;
       }
 
-      // после вставки документа в "documents"
-      const target = process.env.NETLIFY === "true"
-        ? new URL("/.netlify/functions/ingest-background", req.url).toString()
-       : new URL("/api/ingest", req.url).toString();
+      const docId = ins.data.id; // ← ЭТОТ id и нужно передать в воркер
 
-      const r = await fetch(target, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ docId: docIdFromInsert })
-      });
-
-      // На Netlify для background-функции вернётся 202 и пустое тело — это норма.
-
-
-      // 3) Синхронно триггерим индексацию (или см. fire-and-forget ниже)
-      let ingestOk = false;
-      let ingestStatus = 0;
-      let ingestBody = "";
-
+      // 4) триггерим background-функцию
+      let ingestRes: any;
       try {
-        const r = await fetch(`${origin}/api/ingest`, {
+        const resp = await fetch(ingestUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          redirect: "follow",
-          body: JSON.stringify({ docId }),
+          body: JSON.stringify({ docId }), // <-- раньше тут был несуществующий docIdFromInsert
         });
-        ingestStatus = r.status;
-        ingestBody = await r.text();
-        ingestOk = r.ok;
+        const ok = resp.status >= 200 && resp.status < 300;
+        const bodyText = await resp.text().catch(() => "");
+        ingestRes = { ok, status: resp.status, data: bodyText || null };
       } catch (e: any) {
-        ingestStatus = 0;
-        ingestBody = `fetch-error: ${e?.message || String(e)}`;
+        ingestRes = { ok: false, status: 0, data: String(e?.message || e) };
       }
 
       results.push({
@@ -120,21 +114,12 @@ export async function POST(req: NextRequest) {
         size: f.size,
         type: f.type,
         docId,
-        storagePath,
-        ingest: { ok: ingestOk, status: ingestStatus, data: ingestBody },
+        storagePath: key,
+        ingest: ingestRes,
       });
-
-      /* --- Альтернатива: fire-and-forget (не ждать индексацию) ---
-      fetch(`${origin}/api/ingest`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ docId }),
-      }).catch((e) => console.error("ingest kick failed:", e));
-      results.push({ name: f.name, size: f.size, type: f.type, docId, storagePath, ingest: { ok: true, status: 0, data: "queued" } });
-      ------------------------------------------------------------ */
     }
 
-    const allOk = results.every((r) => r.ingest?.ok);
+    const allOk = results.every((r) => r.ingest?.ok !== false);
     return NextResponse.json({ ok: allOk, results });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message || String(e) }, { status: 500 });
