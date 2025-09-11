@@ -23,9 +23,7 @@ export async function POST(req: NextRequest) {
     let docIds: string[] = [];
 
     if (all) {
-      const { data, error } = await supabase
-        .from("documents")
-        .select("id");
+      const { data, error } = await supabase.from("documents").select("id");
       if (error) {
         return NextResponse.json(
           { ok: false, error: error.message },
@@ -42,10 +40,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Помечаем «queued» — приводим тип к any, чтобы не упасть по TS
-    const { error: updErr } = await supabase
-      .from<any>("documents")
-      .update({ status: "queued", error: null } as any)
+    // Помечаем «queued» — приводим клиент к any, чтобы подавить TS-спор о типах
+    const { error: updErr } = await (supabase as any)
+      .from("documents")
+      .update({ status: "queued", error: null })
       .in("id", docIds);
 
     // Если апдейт статуса не прошел — не фейлим весь процесс
