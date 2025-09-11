@@ -81,6 +81,20 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
+      // после вставки документа в "documents"
+      const target = process.env.NETLIFY === "true"
+        ? new URL("/.netlify/functions/ingest-background", req.url).toString()
+       : new URL("/api/ingest", req.url).toString();
+
+      const r = await fetch(target, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ docId: docIdFromInsert })
+      });
+
+      // На Netlify для background-функции вернётся 202 и пустое тело — это норма.
+
+
       // 3) Синхронно триггерим индексацию (или см. fire-and-forget ниже)
       let ingestOk = false;
       let ingestStatus = 0;
