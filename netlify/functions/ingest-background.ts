@@ -167,6 +167,7 @@ export const handler: BackgroundHandler = async (event) => {
       const sub = slice.slice(j, j + SUBBATCH);
       const subEmb = embs.slice(j, j + SUBBATCH);
       const rows = sub.map((content, idx) => ({
+        id: crypto.randomUUID(),                // ← добавили
         document_id: docId!,
         chunk_index: start + j + idx,
         content,

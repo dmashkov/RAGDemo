@@ -151,6 +151,7 @@ export const handler: Handler = async (evt) => {
         const sub = batch.slice(j, j + 16);
         const subEmb = embs.slice(j, j + 16);
         const rows = sub.map((content, idx) => ({
+          id: crypto.randomUUID(),                // ← добавили
           document_id: docId!,
           chunk_index: i + j + idx,
           content,
