@@ -1,15 +1,9 @@
-// Грубая декларация, чтобы TS не ругался при импорте pdfjs в Node/SSR
+// types/pdfjs-dist.d.ts
 declare module 'pdfjs-dist/build/pdf.js' {
-  export const getDocument: any;
-  export const GlobalWorkerOptions: any;
-  const _default: any;
-  export default _default;
+  const anyExport: any;
+  export default anyExport;
 }
-
-// (на будущее, если вдруг перейдём на legacy-вход)
 declare module 'pdfjs-dist/legacy/build/pdf.js' {
-  export const getDocument: any;
-  export const GlobalWorkerOptions: any;
-  const _default: any;
-  export default _default;
+  const anyExport: any;
+  export default anyExport;
 }
