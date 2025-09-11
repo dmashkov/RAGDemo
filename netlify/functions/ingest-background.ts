@@ -3,14 +3,16 @@ import type { BackgroundHandler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 
+// ── настройки
 const BUCKET = process.env.DOCS_BUCKET || "documents";
 const EMB_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
-
-// Диагностические флаги/лимиты
-const USE_FAKE_EMB = process.env.USE_FAKE_EMB === "1";       // ← временно отключаем реальные эмбеддинги
+const USE_FAKE_EMB = process.env.USE_FAKE_EMB === "1"; // можно временно отключить реальные эмбеддинги
 const EMBEDDING_DIM = Number(process.env.EMBEDDING_DIM || "1536");
-const BATCH = Number(process.env.INGEST_BATCH || "32");      // осторожный batch для serverless
-const MAX_CHUNKS = Number(process.env.MAX_CHUNKS || "400");  // ограничение на число чанков за один прогон (для MVP)
+
+// важное: маленькие батчи, чтобы укладываться в время
+const BATCH = Number(process.env.INGEST_BATCH || "24");        // сколько чанков реиндексируем за 1 вызов
+const SUBBATCH = Number(process.env.INGEST_SUBBATCH || "8");    // сколько строк вставляем за 1 insert
+const MAX_CHUNKS = Number(process.env.MAX_CHUNKS || "0");       // 0 = без лимита
 
 function must(name: string) {
   const v = process.env[name];
@@ -26,7 +28,7 @@ const supabase = createClient(
 
 const openai = new OpenAI({ apiKey: must("OPENAI_API_KEY") });
 
-// ---------- utils ----------
+// ── utils
 function normalize(t: string) {
   return (t || "")
     .replace(/\r/g, "\n")
@@ -36,31 +38,32 @@ function normalize(t: string) {
     .trim();
 }
 
+// безопасный чанкер (всегда двигается вперёд)
 function chunkText(t: string, size = 900, overlap = 150) {
   const out: string[] = [];
   let i = 0;
-  while (i < t.length) {
-    const end = Math.min(i + size, t.length);
+  const L = t.length;
+  while (i < L) {
+    const end = Math.min(i + size, L);
     let cut = end;
-    const soft = t.lastIndexOf(" ", end - 20);
+    const soft = t.lastIndexOf(" ", Math.max(i, end - 20));
     if (soft > i + 200) cut = soft;
-    out.push(t.slice(i, cut).trim());
-    i = Math.max(0, cut - overlap);
-    if (i >= t.length) break;
+    const piece = t.slice(i, cut).trim();
+    if (piece) out.push(piece);
+    // гарантируем прогресс хотя бы на 1 символ
+    const next = Math.max(i + 1, cut - overlap);
+    if (next <= i) break;
+    i = next;
   }
-  return out.filter(Boolean);
+  return out;
 }
 
 async function embedBatch(texts: string[]) {
-  if (USE_FAKE_EMB) {
-    // заглушка — помогает проверить вставку в БД/батчинг/лимиты без внешних вызовов
-    return texts.map(() => Array(EMBEDDING_DIM).fill(0));
-  }
+  if (USE_FAKE_EMB) return texts.map(() => Array(EMBEDDING_DIM).fill(0));
   const r = await openai.embeddings.create({ model: EMB_MODEL, input: texts });
   return r.data.map((d) => d.embedding as number[]);
 }
 
-// TXT + DOCX (PDF сознательно отключен для Netlify в MVP)
 async function extractFromStorage(path: string, mime: string | null) {
   const d = await supabase.storage.from(BUCKET).download(path);
   if (d.error || !d.data) throw new Error(`download failed: ${d.error?.message ?? "no data"}`);
@@ -71,142 +74,135 @@ async function extractFromStorage(path: string, mime: string | null) {
   if (mime?.startsWith("text/") || lower.endsWith(".txt")) {
     return normalize(buf.toString("utf8"));
   }
-
   if (mime?.includes("word") || lower.endsWith(".docx")) {
     const mammoth: any = await import("mammoth");
     const { value } = await mammoth.extractRawText({ buffer: buf });
     return normalize(value || "");
   }
-
-  // остальные форматы пока пропускаем
+  // PDF отключаем в MVP на Netlify
   return "";
+}
+
+function getOrigin(rawUrl?: string) {
+  try {
+    if (rawUrl) return new URL(rawUrl).origin;
+  } catch {}
+  // запасной способ: домены Netlify доступны в process.env.URL / DEPLOY_URL
+  return process.env.URL || process.env.DEPLOY_PRIME_URL || "";
+}
+
+async function setStage(docId: string, stage: string) {
+  try {
+    console.log(`[ingest] ${docId} → ${stage}`);
+    await supabase.from("documents").update({ error: stage }).eq("id", docId);
+  } catch (e: any) {
+    console.warn("setStage exception:", e?.message || String(e));
+  }
 }
 
 export const handler: BackgroundHandler = async (event) => {
   let docId: string | undefined;
-
-  const setStage = async (stage: string) => {
-    if (!docId) return;
-    try {
-      console.log(`[ingest] ${docId} → ${stage}`);
-      const u = await supabase.from("documents").update({ error: stage }).eq("id", docId);
-      if (u.error) console.warn("setStage update warning:", u.error.message);
-    } catch (e) {
-      console.warn("setStage exception:", (e as any)?.message || String(e));
-    }
-  };
-
   try {
     const body = event.body ? JSON.parse(event.body) : {};
-    docId = body?.docId;
-    const reindexAll = !!body?.all;
-
-    if (!docId && !reindexAll) {
-      console.warn("ingest-background: missing docId or { all: true }");
+    docId = body?.docId as string | undefined;
+    const start = Number(body?.start || 0); // ← смещение текущего окна
+    if (!docId) {
+      console.warn("ingest-background: missing docId");
       return;
     }
 
-    // ---- одиночный документ ----
-    if (docId) {
-      const { data: doc, error: docErr } = await supabase
-        .from("documents")
-        .select("*")
-        .eq("id", docId)
-        .single();
-      if (docErr || !doc) {
-        console.error("document not found:", docId, docErr?.message);
-        return;
-      }
+    const { data: doc, error: docErr } = await supabase
+      .from("documents")
+      .select("*")
+      .eq("id", docId)
+      .single();
+    if (docErr || !doc) {
+      console.error("document not found:", docId, docErr?.message);
+      return;
+    }
 
+    if (start === 0) {
+      // только на первом шаге
       await supabase.from("documents").update({ status: "processing", error: null }).eq("id", docId);
+    }
 
-      try {
-        await setStage("downloading...");
-        const text = await extractFromStorage(doc.storage_path, doc.mime_type);
+    // 1) download + extract (каждый шаг переизвлекает — дешево, зато надёжно)
+    await setStage(docId, `downloading... (start=${start})`);
+    const text = await extractFromStorage(doc.storage_path, doc.mime_type);
+    if (!text) throw new Error("empty text after extraction");
 
-        await setStage(`extracted: ${text.length} chars`);
-        if (!text) throw new Error("empty text after extraction");
+    // 2) chunk (тоже каждый раз)
+    let parts = chunkText(text);
+    if (MAX_CHUNKS > 0 && parts.length > MAX_CHUNKS) parts = parts.slice(0, MAX_CHUNKS);
+    await setStage(docId, `chunked: ${parts.length} parts`);
 
-        let parts = chunkText(text);
-        if (MAX_CHUNKS > 0 && parts.length > MAX_CHUNKS) {
-          parts = parts.slice(0, MAX_CHUNKS);
-          await setStage(`chunked: ${parts.length} parts (truncated)`);
-        } else {
-          await setStage(`chunked: ${parts.length} parts`);
-        }
-        if (parts.length === 0) throw new Error("no chunks");
+    if (parts.length === 0) throw new Error("no chunks");
 
-        await setStage("clean old chunks");
-        const del = await supabase.from("chunks").delete().eq("document_id", docId);
-        if (del.error) throw new Error(`cleanup chunks failed: ${del.error.message}`);
+    // 3) только на первом шаге очищаем старые чанки
+    if (start === 0) {
+      await setStage(docId, "clean old chunks");
+      const del = await supabase.from("chunks").delete().eq("document_id", docId);
+      if (del.error) throw new Error(`cleanup chunks failed: ${del.error.message}`);
+    }
 
-        for (let i = 0; i < parts.length; i += BATCH) {
-          const batch = parts.slice(i, i + BATCH);
-
-          await setStage(`embedding batch ${i}-${i + batch.length - 1} ${USE_FAKE_EMB ? "(fake)" : ""}`);
-          const embs = await embedBatch(batch);
-
-          await setStage(`inserting batch ${i}-${i + batch.length - 1}`);
-          // дополнительная защита от слишком больших вставок
-          for (let j = 0; j < batch.length; j += 16) {
-            const subBatch = batch.slice(j, j + 16);
-            const subEmbs = embs.slice(j, j + 16);
-            const rows = subBatch.map((content, idx) => ({
-              document_id: docId!,
-              chunk_index: i + j + idx,
-              content,
-              embedding: subEmbs[idx],
-            }));
-            const ins = await supabase.from("chunks").insert(rows);
-            if (ins.error) throw new Error(ins.error.message);
-          }
-        }
-
-        await setStage("finalizing");
-        await supabase
-          .from("documents")
-          .update({ status: "ready", original_text_len: text.length, error: null })
-          .eq("id", docId);
-
-        console.log(`ingest-background: done for ${docId}`);
-      } catch (e: any) {
-        await supabase
-          .from("documents")
-          .update({ status: "error", error: e?.message || String(e) })
-          .eq("id", docId);
-        console.error("ingest-background error:", e);
-      }
-
+    // 4) текущее окно
+    const slice = parts.slice(start, start + BATCH);
+    if (slice.length === 0) {
+      // окон больше нет — финализируем
+      await setStage(docId, "finalizing");
+      await supabase
+        .from("documents")
+        .update({ status: "ready", original_text_len: text.length, error: null })
+        .eq("id", docId);
+      console.log(`ingest-background: done for ${docId}`);
       return;
     }
 
-    // ---- массовый прогон ----
-    const { data: docs, error: selErr } = await supabase.from("documents").select("id");
-    if (selErr) {
-      console.error("select documents failed:", selErr.message);
-      return;
+    await setStage(docId, `embedding ${start}-${start + slice.length - 1} ${USE_FAKE_EMB ? "(fake)" : ""}`);
+    const embs = await embedBatch(slice);
+
+    await setStage(docId, `inserting ${start}-${start + slice.length - 1}`);
+    // маленькими подпорциями
+    for (let j = 0; j < slice.length; j += SUBBATCH) {
+      const sub = slice.slice(j, j + SUBBATCH);
+      const subEmb = embs.slice(j, j + SUBBATCH);
+      const rows = sub.map((content, idx) => ({
+        document_id: docId!,
+        chunk_index: start + j + idx,
+        content,
+        embedding: subEmb[idx],
+      }));
+      const ins = await supabase.from("chunks").insert(rows);
+      if (ins.error) throw new Error(`insert failed: ${ins.error.message}`);
     }
 
-    const origin = (() => {
-      try {
-        return new URL(event.rawUrl).origin;
-      } catch {
-        return "";
-      }
-    })();
-
-    for (const d of docs || []) {
-      try {
-        await fetch(`${origin}/.netlify/functions/ingest-background`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ docId: d.id }),
-        });
-      } catch (e) {
-        console.warn("spawn background failed for", d.id, (e as any)?.message || String(e));
-      }
+    // 5) планируем следующий шаг
+    const origin = getOrigin(event.rawUrl);
+    if (start + BATCH < parts.length) {
+      await setStage(docId, `queued ${start + BATCH}/${parts.length}`);
+      // запускаем следующую инвокацию background-функции
+      await fetch(`${origin}/.netlify/functions/ingest-background`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // предаём следующий offset
+        body: JSON.stringify({ docId, start: start + BATCH }),
+      });
+    } else {
+      // это был последний шаг → финализация
+      await setStage(docId, "finalizing");
+      await supabase
+        .from("documents")
+        .update({ status: "ready", original_text_len: text.length, error: null })
+        .eq("id", docId);
+      console.log(`ingest-background: done for ${docId}`);
     }
-  } catch (e) {
-    console.error("ingest-background top-level error:", e);
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    if (docId) {
+      try {
+        await supabase.from("documents").update({ status: "error", error: `ERROR: ${msg}` }).eq("id", docId);
+      } catch {}
+    }
+    console.error("ingest-background error:", msg);
   }
 };
