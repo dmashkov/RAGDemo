@@ -5,106 +5,90 @@ export const dynamic = "force-dynamic";
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 
-type Body = {
-  scope?: "all" | "pending";   // pending — по умолчанию: всё, что не ready
-  ids?: string[];              // можно явно список id
-  limit?: number;              // на всякий случай ограничитель
-};
-
-function uniq<T>(arr: T[]) {
-  return Array.from(new Set(arr));
-}
+// Куда пуляем инжест: локально — /api/ingest, на Netlify — background-функция
+const FN_BG =
+  process.env.NETLIFY === "true"
+    ? "/.netlify/functions/ingest-background"
+    : "/api/ingest";
 
 export async function POST(req: NextRequest) {
   try {
     const supabase = getSupabaseAdmin();
-    const { scope = "pending", ids = [], limit } = (await req.json().catch(() => ({}))) as Body;
+    const body = await req.json().catch(() => ({} as any));
+    const all: boolean = !!body?.all;
+    const docIdsInput: string[] | undefined = Array.isArray(body?.docIds)
+      ? body.docIds
+      : undefined;
 
-    // 1) соберём список docIds
     let docIds: string[] = [];
 
-    if (ids.length > 0) {
-      docIds = uniq(ids).filter(Boolean);
-    } else {
-      const q = supabase
+    if (all) {
+      const { data, error } = await supabase
         .from("documents")
-        .select("id,status")
-        .order("created_at", { ascending: false });
-
-      const { data, error } = await q;
-      if (error) throw new Error(`select documents failed: ${error.message}`);
-
-      const filtered =
-        scope === "all"
-          ? data
-          : (data || []).filter((d: any) => (d?.status || "") !== "ready");
-
-      docIds = filtered.map((d: any) => d.id);
-      if (typeof limit === "number" && limit > 0) {
-        docIds = docIds.slice(0, limit);
+        .select("id");
+      if (error) {
+        return NextResponse.json(
+          { ok: false, error: error.message },
+          { status: 500 }
+        );
       }
+      docIds = (data ?? []).map((d: any) => d.id as string);
+    } else if (docIdsInput?.length) {
+      docIds = docIdsInput;
+    } else {
+      return NextResponse.json(
+        { ok: false, error: "Provide { all: true } or { docIds: [...] }" },
+        { status: 400 }
+      );
     }
 
-    if (docIds.length === 0) {
-      return NextResponse.json({ ok: true, enqueued: 0, accepted: 0, failed: 0, details: [] });
-    }
-
-    // 2) пометим queued (одним апдейтом)
+    // Помечаем «queued» — приводим тип к any, чтобы не упасть по TS
     const { error: updErr } = await supabase
-      .from("documents")
-      .update({ status: "queued", error: null })
+      .from<any>("documents")
+      .update({ status: "queued", error: null } as any)
       .in("id", docIds);
+
+    // Если апдейт статуса не прошел — не фейлим весь процесс
     if (updErr) {
-      // не фейлим весь запуск — просто зафиксируем
-      console.warn("reindex: mark queued failed:", updErr.message);
+      // можно залогировать при желании
     }
 
-    // 3) триггерим background-функцию для каждого docId
-    const origin = new URL(req.url).origin; // https://your-site…
-    const bgUrl = `${origin}/.netlify/functions/ingest-background`;
+    // Дергаем фоновые инжесты по каждому документу
+    const origin = new URL(req.url).origin;
+    const kicked: string[] = [];
+    const failed: Array<{ id: string; err: string }> = [];
 
-    // ограничим параллелизм (быстрый и простой семафор)
-    const CONCURRENCY = Number(process.env.REINDEX_CONCURRENCY || 6);
-    let idx = 0;
-    let accepted = 0;
-    let failed = 0;
-    const details: Array<{ id: string; ok: boolean; status?: number; error?: string }> = [];
-
-    async function worker() {
-      while (idx < docIds.length) {
-        const i = idx++;
-        const id = docIds[i];
-        try {
-          const r = await fetch(bgUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ docId: id }),
-          });
-          if (r.status === 202 || r.ok) {
-            accepted++;
-            details.push({ id, ok: true, status: r.status });
-          } else {
-            failed++;
-            details.push({ id, ok: false, status: r.status, error: await r.text().catch(() => "") });
-          }
-        } catch (e: any) {
-          failed++;
-          details.push({ id, ok: false, error: e?.message || String(e) });
+    for (const id of docIds) {
+      try {
+        const url = new URL(FN_BG, origin);
+        const r = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ docId: id }),
+        });
+        if (r.ok || r.status === 202) {
+          kicked.push(id);
+        } else {
+          failed.push({ id, err: await r.text() });
         }
+      } catch (e: any) {
+        failed.push({ id, err: e?.message || String(e) });
       }
     }
 
-    const workers = Array.from({ length: Math.min(CONCURRENCY, docIds.length) }, () => worker());
-    await Promise.all(workers);
-
-    return NextResponse.json({
-      ok: failed === 0,
-      enqueued: docIds.length,
-      accepted,
-      failed,
-      details,
-    });
+    return NextResponse.json(
+      {
+        ok: failed.length === 0,
+        queued: docIds.length,
+        kicked,
+        failed,
+      },
+      { status: failed.length ? 207 : 200 }
+    );
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || String(e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || String(e) },
+      { status: 500 }
+    );
   }
 }
