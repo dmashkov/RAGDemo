@@ -6,285 +6,234 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { getSupabaseAdmin } from "@/lib/supabaseAdmin";
 
-// ---- ENV / константы ------------------------------------------------------
+const MAX_CONTEXT_CHUNKS = Number(process.env.MAX_CONTEXT_CHUNKS || 10);
+const CHUNK_CLIP_LEN = Number(process.env.CHUNK_CLIP_LEN || 1200);
+const CITATION_TTL = Number(process.env.CITATION_TTL || 3600);
 
-const LLM_PROVIDER = process.env.LLM_PROVIDER || "openai";
+const EMB_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
 const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-4o-mini";
-
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
-const EMBEDDING_DIM = Number(process.env.EMBEDDING_DIM || 1536);
-
 const DOCS_BUCKET = process.env.DOCS_BUCKET || "documents";
 
-// сколько чанков подмешиваем в контекст
-const MAX_CONTEXT_CHUNKS = Number(process.env.MAX_CONTEXT_CHUNKS || 12);
-
-// срок жизни подписанных ссылок на источники (сек)
-const CITATION_TTL_SEC = Number(process.env.CITATION_TTL || 3600);
-
-// мягкий лимит длины одного чанка (для подсказки LLM)
-const CHUNK_CLIP_LEN = Number(process.env.CHUNK_CLIP_LEN || 1200);
-
-// ---- типы лёгкие (минимум строгости, чтобы не падать на сборке) ----------
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY!,
+});
 
 type ChatMessage = { role: "user" | "assistant" | "system"; content: string };
 
-type RpcChunkRow = {
+type MatchRow = {
+  id?: string;
   document_id: string;
-  chunk_index: number;
+  chunk_index?: number;
   content: string;
   similarity?: number;
   rank?: number;
 };
 
+type DocMeta = {
+  id: string;
+  filename: string;
+  storage_path?: string | null;
+};
+
 type Citation = {
-  n: number;            // номер источника для [#n]
+  n: number;
   docId: string;
   filename: string;
   url: string | null;
   preview?: string;
 };
 
-// ---- утилиты ---------------------------------------------------------------
-
-function assertEnv(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`ENV ${name} is missing`);
-  return v;
-}
-
-function clip(s: string, n: number) {
+function clip(s: string, n = CHUNK_CLIP_LEN) {
   if (!s) return s;
-  return s.length > n ? s.slice(0, n) + " ..." : s;
+  return s.length <= n ? s : s.slice(0, n) + " …";
 }
 
-/** Заменяем [#n] на markdown-ссылку, если есть URL в citations */
-function linkifyHashes(markdown: string, citations: Citation[]) {
-  return markdown.replace(/\[#(\d+)\]/g, (_, numStr) => {
-    const n = Number(numStr);
+function linkRefs(answer: string, citations: Citation[]) {
+  // Заменяем [#1] на кликабельную ссылку
+  return answer.replace(/\[#(\d+)\]/g, (_, g1) => {
+    const n = Number(g1);
     const c = citations.find((x) => x.n === n);
-    // экранируем # в ссылке, чтобы не спутать с заголовком
-    return c?.url ? `[\\#${n}](${c.url} "${c.filename}")` : `[#${n}]`;
+    if (!c || !c.url) return `[#${n}]`;
+    return `[[#${n}]](${c.url})`;
   });
 }
-
-// ---- ядро ------------------------------------------------------------------
-
-const openai = new OpenAI({
-  apiKey: LLM_PROVIDER === "openai" ? assertEnv("OPENAI_API_KEY") : undefined,
-});
 
 async function embedQuery(q: string) {
-  // Можно добавить USE_FAKE_EMB=1 для отладки
-  if (process.env.USE_FAKE_EMB === "1") {
-    return new Array(EMBEDDING_DIM).fill(0);
-  }
-  const res = await openai.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: q,
-  });
-  return res.data[0].embedding as number[];
-}
-
-async function fetchTopChunks(
-  supabase: ReturnType<typeof getSupabaseAdmin>,
-  queryText: string,
-  queryVec: number[],
-  limit: number
-): Promise<RpcChunkRow[]> {
-  // 1) Пытаемся гибрид (если создана RPC функция hybrid_match_chunks)
-  try {
-    const r = await (supabase as any).rpc("hybrid_match_chunks", {
-      query_text: queryText,
-      query_embedding: queryVec,
-      match_count: limit,
-    });
-    if (!r.error && Array.isArray(r.data) && r.data.length) {
-      return r.data as RpcChunkRow[];
-    }
-  } catch {
-    // молча падаем на fallback
-  }
-
-  // 2) Fallback: только векторный матч
-  const r2 = await (supabase as any).rpc("match_chunks", {
-    query_embedding: queryVec,
-    match_count: limit,
-  });
-  if (r2.error) {
-    throw new Error(`match_chunks failed: ${r2.error.message}`);
-  }
-  return (r2.data || []) as RpcChunkRow[];
-}
-
-function buildSystemPrompt() {
-  // Короткий system prompt: жёстко приземляем ответ на данные из контекста
-  return [
-    "Ты — ассистент, отвечающий строго на основе предоставленного контекста (фрагменты из документов).",
-    "Если ответ напрямую не следует из контекста — скажи, чего не хватает, и предложи уточнить/загрузить нужный документ.",
-    "В ответе ставь ссылки-цитаты там, где используешь факт: формат [#N], где N — номер источника из списка ниже.",
-  ].join("\n");
-}
-
-function buildContextBlock(
-  top: RpcChunkRow[],
-  docNumbers: Record<string, number>
-) {
-  // Строим единый текстовый блок контекста, с пометкой, к какому источнику относится чанк
-  const parts: string[] = [];
-  top.forEach((row) => {
-    const n = docNumbers[row.document_id] ?? 0;
-    const chunk = clip(row.content || "", CHUNK_CLIP_LEN);
-    parts.push(`[#${n}] ${chunk}`);
-  });
-  return parts.join("\n\n");
+  const r = await openai.embeddings.create({ model: EMB_MODEL, input: q });
+  return r.data[0].embedding as number[];
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const supabase = getSupabaseAdmin();
+    const body = (await req.json().catch(() => ({}))) as {
+      messages?: ChatMessage[];
+    };
 
-    // ---- читаем вход ----
-    const body = await req.json().catch(() => ({} as any));
-    const messages: ChatMessage[] = Array.isArray(body?.messages)
-      ? body.messages
-      : [];
-
-    let lastUser = body?.text?.toString?.() || "";
-    if (!lastUser) {
-      const rev = [...messages].reverse();
-      const u = rev.find((m) => m.role === "user");
-      lastUser = u?.content || "";
-    }
-    if (!lastUser.trim()) {
+    const messages = body?.messages ?? [];
+    const lastUser = [...messages].reverse().find((m) => m.role === "user")
+      ?.content;
+    if (!lastUser || !lastUser.trim()) {
       return NextResponse.json(
-        { error: "Пустой запрос" },
+        { error: "Empty prompt" },
         { status: 400 }
       );
     }
 
-    // ---- вектор запроса ----
+    const supabase = getSupabaseAdmin();
+
+    // 1) Эмбеддинг запроса
     const qVec = await embedQuery(lastUser);
 
-    // ---- top-чанки ----
-    const top = await fetchTopChunks(supabase, lastUser, qVec, MAX_CONTEXT_CHUNKS);
+    // 2) Поиск релевантных чанков: сначала гибридный, иначе — через векторный RPC
+    let top: MatchRow[] = [];
+    try {
+      const r = await (supabase as any).rpc("hybrid_match_chunks", {
+        query_text: lastUser,
+        query_embedding: qVec,
+        match_count: MAX_CONTEXT_CHUNKS,
+      });
+      if (!r.error && Array.isArray(r.data)) {
+        top = r.data as MatchRow[];
+      }
+    } catch {
+      /* no-op */
+    }
 
-    // Если вдруг пусто — аккуратно отвечаем
-    if (!top.length) {
+    if (top.length === 0) {
+      const r2 = await (supabase as any).rpc("match_chunks", {
+        query_embedding: qVec,
+        match_count: MAX_CONTEXT_CHUNKS,
+      });
+      if (r2.error) {
+        return NextResponse.json(
+          { error: `match_chunks failed: ${r2.error.message}` },
+          { status: 500 }
+        );
+      }
+      top = (r2.data || []) as MatchRow[];
+    }
+
+    if (top.length === 0) {
+      // На крайний случай — мягкий ответ без контекста, чтобы UX не «падал»
+      const fallback = await openai.chat.completions.create({
+        model: CHAT_MODEL,
+        temperature: 0.2,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Ты ассистент. Если нет контекста из документов, вежливо скажи, что не нашёл нужных материалов.",
+          },
+          { role: "user", content: lastUser },
+        ],
+      });
+      const text =
+        fallback.choices?.[0]?.message?.content ||
+        "Не удалось найти подходящих фрагментов в базе документов.";
       return NextResponse.json({
-        answer:
-          "Я не нашёл подходящих фрагментов в ваших документах для ответа. Попробуйте переформулировать вопрос или загрузите релевантный файл.",
+        answer: text,
+        answer_linked: text,
         citations: [],
-        top: [],
       });
     }
 
-    // ---- собираем список документов по порядку появления ----
-    const docOrder: string[] = [];
-    for (const r of top) {
-      if (!docOrder.includes(r.document_id)) docOrder.push(r.document_id);
+    // 3) Группируем по документам / собираем порядок документов
+    const byDoc = new Map<string, MatchRow[]>();
+    for (const row of top) {
+      if (!row?.document_id || !row?.content) continue;
+      if (!byDoc.has(row.document_id)) byDoc.set(row.document_id, []);
+      byDoc.get(row.document_id)!.push(row);
     }
 
-    // ---- метаданные документов ----
-    const { data: docsMeta, error: docsErr } = await supabase
+    const docOrder = Array.from(byDoc.keys());
+    const allDocIds = docOrder;
+
+    // 4) Подтянем метаданные документов (id, filename, storage_path)
+    const { data: docsRes, error: docsErr } = await supabase
       .from("documents")
       .select("id, filename, storage_path")
-      .in("id", docOrder);
+      .in("id", allDocIds);
+
     if (docsErr) {
-      // не фейлим — просто не сможем подписать ссылки
-      console.warn("chat/docs meta error:", docsErr.message);
+      return NextResponse.json(
+        { error: `documents select failed: ${docsErr.message}` },
+        { status: 500 }
+      );
     }
 
-    // ---- выдаём номера документам (для [#N]) ----
-    const docNumbers: Record<string, number> = {};
-    docOrder.forEach((id, i) => (docNumbers[id] = i + 1));
+    const docsMeta: DocMeta[] = (docsRes ?? []) as unknown as DocMeta[];
 
-    // ---- подписанные ссылки ----
+    // Для удобства — мапа id -> meta
+    const docsMap = new Map(docsMeta.map((d) => [d.id, d]));
+
+    // 5) Сгенерируем signed URL для каждого документа (если есть storage_path)
     const citations: Citation[] = [];
+    let counter = 1;
+
     for (const id of docOrder) {
-      const meta = docsMeta?.find((d) => d.id === id);
+      const meta = docsMap.get(id);
       if (!meta) continue;
 
       let url: string | null = null;
-
-      // Если бакет публичный — можно так:
-      // const pub = supabase.storage.from(DOCS_BUCKET).getPublicUrl(meta.storage_path);
-      // url = pub.data?.publicUrl || null;
-
-      // По умолчанию используем приватный бакет с подписанными ссылками
-      const signed = await supabase.storage
-        .from(DOCS_BUCKET)
-        .createSignedUrl(meta.storage_path, CITATION_TTL_SEC);
-
-      if (!signed.error) {
-        url = signed.data?.signedUrl || null;
-      } else {
-        console.warn("chat/signed url error:", signed.error.message);
+      if (meta.storage_path) {
+        const signed = await supabase.storage
+          .from(DOCS_BUCKET)
+          .createSignedUrl(meta.storage_path, CITATION_TTL)
+          .then((r) => (r.error ? null : r.data?.signedUrl || null))
+          .catch(() => null);
+        url = signed;
       }
 
+      // Превью — первые 120 символов первого чанка
+      const firstChunk = byDoc.get(id)?.[0]?.content ?? "";
+      const preview =
+        firstChunk ? clip(firstChunk, 120).replace(/\s+/g, " ") : undefined;
+
       citations.push({
-        n: docNumbers[id],
+        n: counter++,
         docId: id,
         filename: meta.filename,
         url,
-        preview: clip(top.find((t) => t.document_id === id)?.content || "", 180),
+        preview,
       });
     }
 
-    // ---- контекст для LLM ----
-    const contextBlock = buildContextBlock(top, docNumbers);
-
-    // ---- подсказка для модели ----
-    const systemPrompt = buildSystemPrompt();
-    const userPrompt = [
-      "Вопрос:",
-      lastUser,
-      "",
-      "Контекст (фрагменты из документов):",
-      contextBlock,
-      "",
-      "Инструкции:",
-      "- Отвечай по сути и кратко.",
-      "- По месту факта ставь цитаты [#N].",
-      "- В конце при необходимости добавь краткие шаги/советы.",
-    ].join("\n");
-
-    // ---- вызов LLM ----
-    let answer = "";
-    if (LLM_PROVIDER === "openai") {
-      const comp = await openai.chat.completions.create({
-        model: CHAT_MODEL,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0.2,
-      });
-      answer = comp.choices?.[0]?.message?.content?.trim() || "";
-    } else {
-      throw new Error(`Unsupported LLM_PROVIDER: ${LLM_PROVIDER}`);
+    // 6) Собираем контекст для LLM
+    // Формат: блоки с метками [#n], чтобы можно было сослаться на них в ответе.
+    let ctx = "";
+    for (const c of citations) {
+      const rows = (byDoc.get(c.docId) || []).slice(0, 3); // не больше 3 чанков с документа
+      const merged = rows.map((r) => r.content).join("\n");
+      if (!merged.trim()) continue;
+      ctx += `\n[ #${c.n} — ${c.filename} ]\n${clip(merged)}\n`;
     }
+    ctx = ctx.trim();
 
-    if (!answer) {
-      answer =
-        "Не смог сформировать ответ на основе найденных фрагментов. Попробуйте уточнить вопрос.";
-    }
+    // 7) Генерация ответа
+    const system =
+      "Ты — ассистент RAG. Отвечай только на основе контекста ниже. Если нет ответа в контексте, прямо скажи об этом. Вставляй ссылки на источники в виде [#N]. Не придумывай факты.";
+    const userPrompt = `Вопрос:\n${lastUser}\n\nКонтекст из документов:\n${ctx || "(нет контекста)"}\n\nИнструкции:\n- Используй только факты из контекста.\n- После фактов ставь ссылки вида [#1], [#2] и т.д., соответствующие блокам выше.\n`;
 
-    // ---- делаем кликабельные [#N] внутри текста ----
-    const answer_linked = linkifyHashes(answer, citations);
+    const completion = await openai.chat.completions.create({
+      model: CHAT_MODEL,
+      temperature: 0.1,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userPrompt },
+      ],
+    });
 
-    // ---- отдаём результат ----
+    let answer =
+      completion.choices?.[0]?.message?.content?.trim() ||
+      "Не удалось сгенерировать ответ.";
+    const answer_linked = linkRefs(answer, citations);
+
     return NextResponse.json({
       answer,
       answer_linked,
       citations,
-      top, // можно убрать в проде; полезно для отладки
     });
   } catch (e: any) {
-    console.error("/api/chat error:", e);
-    return NextResponse.json(
-      { error: e?.message || String(e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 });
   }
 }
