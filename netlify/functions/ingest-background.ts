@@ -1,8 +1,5 @@
 // netlify/functions/ingest-background.ts
-// Background Function — Netlify отдаёт 202 сразу, код работает в фоне.
-// НИЧЕГО не возвращаем из handler.
-
-import type { HandlerEvent, HandlerContext } from "@netlify/functions";
+import type { BackgroundHandler } from "@netlify/functions";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
 
@@ -16,7 +13,12 @@ function must(name: string) {
   return v;
 }
 
-const supabase = createClient(must("NEXT_PUBLIC_SUPABASE_URL"), must("SUPABASE_SERVICE_ROLE_KEY"));
+const supabase = createClient(
+  must("NEXT_PUBLIC_SUPABASE_URL"),
+  must("SUPABASE_SERVICE_ROLE_KEY"),
+  { auth: { persistSession: false } }
+);
+
 const openai = new OpenAI({ apiKey: must("OPENAI_API_KEY") });
 
 function normalize(t: string) {
@@ -48,77 +50,98 @@ async function embedBatch(texts: string[]) {
   return r.data.map((d) => d.embedding as number[]);
 }
 
-export async function handler(event: HandlerEvent, _ctx: HandlerContext): Promise<void> {
+async function extractFromStorage(path: string, mime: string | null) {
+  const d = await supabase.storage.from(BUCKET).download(path);
+  if (d.error || !d.data) throw new Error(`download failed: ${d.error?.message ?? "no data"}`);
+
+  const buf = Buffer.from(await d.data.arrayBuffer());
+  const lower = path.toLowerCase();
+
+  // MVP: поддерживаем TXT и DOCX (PDF отключён для Netlify)
+  if (mime?.startsWith("text/") || lower.endsWith(".txt")) {
+    return normalize(buf.toString("utf8"));
+  }
+  if (mime?.includes("word") || lower.endsWith(".docx")) {
+    const mammoth = await import("mammoth");
+    const { value } = await mammoth.extractRawText({ buffer: buf });
+    return normalize(value || "");
+  }
+
+  // прочие форматы пока игнорим
+  return "";
+}
+
+export const handler: BackgroundHandler = async (event) => {
   let docId: string | undefined;
+
   try {
     const body = event.body ? JSON.parse(event.body) : {};
     docId = body?.docId;
-    if (!docId) throw new Error("docId is required");
+    const reindexAll = !!body?.all;
 
-    // 1) документ
-    const { data: doc, error: docErr } = await supabase
-      .from("documents")
-      .select("*")
-      .eq("id", docId)
-      .single();
-    if (docErr || !doc) throw new Error(`document not found: ${docId}`);
-
-    await supabase.from("documents").update({ status: "processing", error: null }).eq("id", docId);
-
-    // 2) скачиваем файл
-    const dl = await supabase.storage.from(BUCKET).download(doc.storage_path);
-    if (dl.error || !dl.data) throw new Error(`download failed: ${dl.error?.message ?? "no data"}`);
-    const buf = Buffer.from(await dl.data.arrayBuffer());
-    const lower = String(doc.storage_path).toLowerCase();
-    const mime = String(doc.mime_type || "");
-
-    // 3) извлекаем ТОЛЬКО TXT/DOCX (PDF — пока выключен)
-    let text = "";
-    if (mime.includes("pdf") || lower.endsWith(".pdf")) {
-      throw new Error("PDF extraction is disabled on Netlify (temporary)");
-    } else if (mime.includes("word") || lower.endsWith(".docx")) {
-      const mammoth = await import("mammoth");
-      const { value } = await mammoth.extractRawText({ buffer: buf });
-      text = normalize(value || "");
-    } else if (mime.startsWith("text/") || lower.endsWith(".txt")) {
-      text = normalize(buf.toString("utf8"));
-    } else {
-      throw new Error(`Unsupported mime: ${mime}`);
-    }
-    if (!text) throw new Error("empty text after extraction");
-
-    // 4) чанки + эмбеддинги
-    const parts = chunkText(text);
-    if (parts.length === 0) throw new Error("no chunks");
-
-    await supabase.from("chunks").delete().eq("document_id", docId);
-
-    for (let i = 0; i < parts.length; i += BATCH) {
-      const batch = parts.slice(i, i + BATCH);
-      const embs = await embedBatch(batch);
-      const rows = batch.map((content, idx) => ({
-        document_id: docId!,
-        chunk_index: i + idx,
-        content,
-        embedding: embs[idx],
-      }));
-      const ins = await supabase.from("chunks").insert(rows);
-      if (ins.error) throw new Error(ins.error.message);
+    if (!docId && !reindexAll) {
+      console.warn("ingest-background: missing docId or { all: true }");
+      return;
     }
 
-    await supabase
-      .from("documents")
-      .update({ status: "ready", original_text_len: text.length, error: null })
-      .eq("id", docId);
-
-    console.log(`[ingest-background] done doc=${docId}, len=${text.length}, chunks=${parts.length}`);
-  } catch (e: any) {
-    console.error("[ingest-background] FAILED:", e?.message || e);
     if (docId) {
+      const { data: doc, error: docErr } = await supabase
+        .from("documents")
+        .select("*")
+        .eq("id", docId)
+        .single();
+      if (docErr || !doc) throw new Error(`document not found: ${docId}`);
+
+      await supabase.from("documents").update({ status: "processing", error: null }).eq("id", docId);
+
       try {
+        const text = await extractFromStorage(doc.storage_path, doc.mime_type);
+        if (!text) throw new Error("empty text after extraction");
+
+        const parts = chunkText(text);
+        if (parts.length === 0) throw new Error("no chunks");
+
+        await supabase.from("chunks").delete().eq("document_id", docId);
+
+        for (let i = 0; i < parts.length; i += BATCH) {
+          const batch = parts.slice(i, i + BATCH);
+          const embs = await embedBatch(batch);
+          const rows = batch.map((content, idx) => ({
+            document_id: docId!,
+            chunk_index: i + idx,
+            content,
+            embedding: embs[idx],
+          }));
+          const ins = await supabase.from("chunks").insert(rows);
+          if (ins.error) throw new Error(ins.error.message);
+        }
+
+        await supabase
+          .from("documents")
+          .update({ status: "ready", original_text_len: text.length, error: null })
+          .eq("id", docId);
+
+        console.log(`ingest-background: done for ${docId}`);
+      } catch (e: any) {
         await supabase.from("documents").update({ status: "error", error: e?.message || String(e) }).eq("id", docId);
-      } catch {}
+        console.error("ingest-background error:", e);
+      }
+
+      return;
     }
-    // Ничего не возвращаем — Netlify сам вернёт 202 при старте, а ошибку увидим в логах.
+
+    // reindex all (по одному документу, чтобы не упереться в лимиты)
+    const { data: docs, error: selErr } = await supabase.from("documents").select("id");
+    if (selErr) throw new Error(selErr.message);
+
+    for (const d of docs || []) {
+      await fetch(new URL("/.netlify/functions/ingest-background", event.rawUrl).toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ docId: d.id }),
+      });
+    }
+  } catch (e) {
+    console.error("ingest-background top-level error:", e);
   }
-}
+};
