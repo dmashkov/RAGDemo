@@ -18,45 +18,45 @@ const supabase = createClient(env("NEXT_PUBLIC_SUPABASE_URL"), env("SUPABASE_SER
 
 function sanitizeFilename(name: string) {
   const base = (name || "file").normalize("NFKC");
-  // ASCII-безопасно, без юникод-классов \p{L} — SWC/Next не спотыкается
+  // Без \p{…} — SWC не спотыкается
   return base.replace(/[^\w.\- ]+/g, "_").replace(/\s+/g, "_").slice(0, 140);
 }
 
 export async function POST(req: NextRequest) {
   try {
     const form = await req.formData();
-    const files = form.getAll("files") as File[];
-    if (!files?.length) {
+    const files = (form.getAll("files") as unknown[]).filter(Boolean) as File[];
+    if (!files.length) {
       return NextResponse.json({ ok: false, error: "No files provided" }, { status: 400 });
     }
 
     const results: any[] = [];
+    // Абсолютный origin для межфункционального вызова на Netlify
+    const origin = process.env.URL || process.env.NEXT_PUBLIC_SITE_URL || new URL(req.url).origin;
 
     for (const f of files) {
       const docId = randomUUID();
       const safe = sanitizeFilename(f.name);
       const storagePath = `${docId}__${safe}`;
 
-      // 1) кладём файл в Supabase Storage
+      // 1) Upload в Supabase Storage
       const ab = await f.arrayBuffer();
-      const upload = await supabase.storage
-        .from(BUCKET)
-        .upload(storagePath, Buffer.from(ab), {
-          contentType: f.type || "application/octet-stream",
-          upsert: false,
-        });
+      const up = await supabase.storage.from(BUCKET).upload(storagePath, Buffer.from(ab), {
+        contentType: f.type || "application/octet-stream",
+        upsert: false,
+      });
 
-      if (upload.error) {
+      if (up.error) {
         results.push({
           name: f.name,
           size: f.size,
           type: f.type,
-          error: `storage upload: ${upload.error.message}`,
+          error: `storage upload: ${up.error.message}`,
         });
         continue;
       }
 
-      // 2) создаём запись документа (id задаём сами = docId)
+      // 2) Запись в documents (id задаём сами)
       const ins = await supabase
         .from("documents")
         .insert({
@@ -81,47 +81,43 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // Надёжно формируем абсолютный origin (Netlify даёт process.env.URL)
-      const origin = process.env.URL || new URL(req.url).origin;
-      let ingestOk = false, ingestStatus = 0, ingestBody = '';
+      // 3) Синхронно триггерим индексацию (или см. fire-and-forget ниже)
+      let ingestOk = false;
+      let ingestStatus = 0;
+      let ingestBody = "";
 
       try {
-      const resp = await fetch(`${origin}/api/ingest`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      // на всякий случай полностью отключим кэш и редиректы
-      redirect: 'follow',
-      body: JSON.stringify({ docId }),
-      }
-      );
-      ingestStatus = resp.status;
-      ingestBody = await resp.text();
-      ingestOk = resp.ok;
+        const r = await fetch(`${origin}/api/ingest`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          redirect: "follow",
+          body: JSON.stringify({ docId }),
+        });
+        ingestStatus = r.status;
+        ingestBody = await r.text();
+        ingestOk = r.ok;
       } catch (e: any) {
-      ingestStatus = 0;
-      ingestBody = `fetch-error: ${e?.message || String(e)}`;
+        ingestStatus = 0;
+        ingestBody = `fetch-error: ${e?.message || String(e)}`;
       }
 
-      results.push({
-      name: f.name,
-      size: f.size,
-      type: f.type,
-      docId,
-      storagePath,
-      ingest: { ok: ingestOk, status: ingestStatus, data: ingestBody },
-      }
-      );
-
-
-      const data = await resp.text();
       results.push({
         name: f.name,
         size: f.size,
         type: f.type,
         docId,
         storagePath,
-        ingest: { ok: resp.ok, status: resp.status, data },
+        ingest: { ok: ingestOk, status: ingestStatus, data: ingestBody },
       });
+
+      /* --- Альтернатива: fire-and-forget (не ждать индексацию) ---
+      fetch(`${origin}/api/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ docId }),
+      }).catch((e) => console.error("ingest kick failed:", e));
+      results.push({ name: f.name, size: f.size, type: f.type, docId, storagePath, ingest: { ok: true, status: 0, data: "queued" } });
+      ------------------------------------------------------------ */
     }
 
     const allOk = results.every((r) => r.ingest?.ok);
