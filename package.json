@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@netlify/functions": "^4.2.5",
     "@supabase/supabase-js": "^2.57.4",
     "ai": "^3.3.21",
     "autoprefixer": "^10.4.20",
